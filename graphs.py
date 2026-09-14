@@ -1,4 +1,4 @@
-# ========================= graphs_test.py =========================
+# ========================= graphs.py =========================
 
 import plotly.graph_objects as go
 import numpy as np
