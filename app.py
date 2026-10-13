@@ -1,236 +1,335 @@
-# ========================= app.py =========================
-import streamlit as st
+"""
+app.py — AetherFlight
+======================
+Streamlit front-end: collects aircraft parameters from the sidebar, runs
+the aerodynamics (physics.py) and takeoff simulation (simulation.py), and
+renders the results as metrics, status messages, and Plotly charts
+(graphs.py).
+
+Module boundary: this file owns UI/orchestration ONLY — no aerodynamic or
+time-stepping math lives here; it just collects inputs, calls the two
+engine modules, and displays what comes back.
+"""
+
 import numpy as np
-from physics import calculate_aerodynamics
-from simulation import simulate_takeoff
+import streamlit as st
+
+from physics import calculate_aerodynamics, G
+from simulation import simulate_takeoff, LIFTOFF_LIFT_MARGIN
 from graphs import create_flight_graphs
 
-st.set_page_config(page_title="AetherFlight", layout="wide")
+MS_TO_KMH = 3.6
+APP_VERSION = "1.0.0"
 
-st.markdown("""
-<style>
-body { background-color: #0b0f1a; color: #e6f1ff; }
-[data-testid="stMetric"] {
-    background-color: #111827;
-    border-radius: 12px;
-    padding: 15px;
-    text-align: center;
-    box-shadow: 0px 0px 10px rgba(0,255,200,0.1);
+# ============================================================
+# Slider ranges per "Aircraft Type" — purely a UI convenience for picking
+# sensible defaults. It has NO effect on the physics itself (see
+# physics.py / simulation.py, which never receive plane_type at all).
+# ============================================================
+PLANE_TYPE_RANGES = {
+    "Light RC": {
+        "weight":    dict(min_value=0.01, max_value=1.0, value=0.8, step=0.001),
+        "wing_area": dict(min_value=0.05, max_value=0.3, value=0.12, step=0.001),
+        "thrust":    dict(min_value=5.0, max_value=40.0, value=15.0, step=0.1),
+    },
+    "Sport RC": {
+        "weight":    dict(min_value=1.0, max_value=5.0, value=2.5, step=0.001),
+        "wing_area": dict(min_value=0.1, max_value=0.5, value=0.25, step=0.001),
+        "thrust":    dict(min_value=50.0, max_value=150.0, value=50.0, step=1.0),
+    },
+    "Heavy RC": {
+        "weight":    dict(min_value=5.0, max_value=15.0, value=10.0, step=0.001),
+        "wing_area": dict(min_value=0.3, max_value=2.0, value=0.6, step=0.001),
+        "thrust":    dict(min_value=100.0, max_value=500.0, value=150.0, step=1.0),
+    },
 }
-h1, h2, h3 { color: #00ffd5; }
-</style>
-""", unsafe_allow_html=True)
 
-st.title("✈️ AetherFlight")
-st.subheader("Flight Simulation & Analysis")
-st.markdown("---")
 
-# ========================= SIDEBAR =========================
-st.sidebar.header("Aircraft Setup")
+# ============================================================
+# Small formatting helpers — the ONLY place speed unit conversion happens
+# in the UI, so every metric/chart stays consistent with the sidebar's
+# unit toggle.
+# ============================================================
+def convert_speed(value_ms, unit):
+    """Convert an SI speed (m/s) to the display unit. Returns a raw float."""
+    return value_ms * MS_TO_KMH if unit == "km/h" else value_ms
 
-plane_type = st.sidebar.selectbox(
-    "Aircraft Type",
-    ["Light RC", "Sport RC", "Heavy RC", "Custom"]
-)
-# NOTE: plane_type is now ONLY used to pick slider ranges below — it no longer feeds into the physics at all (see physics.py changelog).
 
-aircraft_class = st.sidebar.selectbox(
-    "Aircraft Class",
-    ["Trainer", "Flying Wing", "EDF Jet", "Glider", "Aerobatic", "Warbird"]
-)
+def format_speed(value_ms, unit, decimals=1):
+    """Convert + format an SI speed (m/s) as a display string, e.g. '42.8 km/h'."""
+    return f"{convert_speed(value_ms, unit):.{decimals}f} {unit}"
 
-with st.sidebar.expander("Parameters", expanded=True):
-    if plane_type == "Light RC":
-        weight = st.slider("Weight (kg)", 0.01, 1.0, 0.8, 0.001)
-        wing_area = st.slider("Wing Area (m²)", 0.05, 0.3, 0.12, 0.001)
-        thrust = st.slider("Thrust (N)", 5.0, 40.0, 15.0, 0.1)
-    elif plane_type == "Sport RC":
-        weight = st.slider("Weight (kg)", 1.0, 5.0, 2.5, 0.001)
-        wing_area = st.slider("Wing Area (m²)", 0.1, 0.5, 0.25, 0.001)
-        thrust = st.slider("Thrust (N)", 50.0, 150.0, 50.0, 1.0)
-    elif plane_type == "Heavy RC":
-        weight = st.slider("Weight (kg)", 5.0, 15.0, 10.0, 0.001)
-        wing_area = st.slider("Wing Area (m²)", 0.3, 2.0, 0.6, 0.001)
-        thrust = st.slider("Thrust (N)", 100.0, 500.0, 150.0, 1.0)
-    else:
-        weight = st.number_input("Weight (kg)", min_value=0.01, value=1.5)
-        wing_area = st.number_input("Wing Area (m²)", min_value=0.01, value=0.2)
-        thrust = st.number_input("Thrust (N)", min_value=0.1, value=30.0)
 
-with st.sidebar.expander("Wing Parameters"):
-    cd_base = st.slider("Drag Coefficient (Cd)", 0.02, 0.2, 0.05, 0.001)
-    aoa = st.slider("Angle of Attack (°)", -5.0, 20.0, 5.0, 0.1)
-    stall_aoa = st.slider("Critical AoA (°)", 10.0, 20.0, 15.0)
-    chord = st.slider("Mean Chord (m)", 0.05, 0.5, 0.15)
+def inject_styles():
+    """App-wide dark theme and metric-card styling."""
+    st.markdown("""
+    <style>
+    body { background-color: #0b0f1a; color: #e6f1ff; }
+    [data-testid="stMetric"] {
+        background-color: #111827;
+        border-radius: 12px;
+        padding: 15px;
+        text-align: center;
+        box-shadow: 0px 0px 10px rgba(0,255,200,0.1);
+    }
+    h1, h2, h3 { color: #00ffd5; }
+    </style>
+    """, unsafe_allow_html=True)
 
-with st.sidebar.expander("Flight Conditions"):
-    wind = st.slider("Headwind (+) / Tailwind (-) km/h", -30, 30, 0) / 3.6
-    pitch_speed = st.slider("Prop Pitch Speed (m/s)", 10.0, 80.0, 45.0)
 
-unit = st.sidebar.selectbox("Speed Unit", ["m/s", "km/h"])
+# ============================================================
+# Sidebar — input collection
+# ============================================================
+def render_sidebar():
+    """Collect every aircraft/flight-condition input from the sidebar.
+    Returns a dict of raw values, ready to hand to physics/simulation."""
+    st.sidebar.header("Aircraft Setup")
 
-# ========================= CALCULATIONS =========================
-aero_results = calculate_aerodynamics(
-    weight, wing_area, thrust, cd_base,
-    aoa, stall_aoa, chord, wind,
-    pitch_speed, aircraft_class
-)
+    plane_type = st.sidebar.selectbox(
+        "Aircraft Type", list(PLANE_TYPE_RANGES) + ["Custom"],
+        help="Picks sensible slider ranges below. Has no effect on the physics."
+    )
+    aircraft_class = st.sidebar.selectbox(
+        "Aircraft Class",
+        ["Trainer", "Flying Wing", "EDF Jet", "Glider", "Aerobatic", "Warbird"],
+        help="Sets drag/lift/efficiency characteristics typical of this airframe style."
+    )
 
-sim_results = simulate_takeoff(
-    weight, wing_area, thrust, cd_base,
-    aoa, stall_aoa, chord, wind,
-    pitch_speed, aircraft_class
-)
-
-# ========================= EXTRACT DATA =========================
-lift = aero_results["lift"]
-drag = aero_results["drag"]
-relative_velocity = aero_results["relative_velocity"]
-stall_speed = aero_results["stall_speed"]
-cl_max = aero_results["cl_max"]
-max_airspeed = aero_results["max_airspeed"]
-max_groundspeed = aero_results["max_groundspeed"]
-ld_ratio = aero_results["ld_ratio"]
-thrust_curve = aero_results["thrust_curve"]
-wing_loading = aero_results["wing_loading"]
-Re = np.max(aero_results["re_curve"])
-aspect_ratio = aero_results["aspect_ratio"]
-induced_drag_factor = aero_results["induced_drag_factor"]
-oswald_efficiency = aero_results["oswald_efficiency"]
-
-takeoff_distance = sim_results["takeoff_distance"]
-takeoff_speed = sim_results["takeoff_speed"]
-takeoff_time = sim_results["takeoff_time"]
-vel_time = sim_results["vel_time"]
-dist_time = sim_results["dist_time"]
-time_data = sim_results["time_data"]
-accel_time = sim_results["accel_time"]
-
-# ========================= DISPLAY UNITS =========================
-# Max Speed now reported as GROUNDSPEED (what you'd see the plane do over the field) — this only differs from airspeed when wind != 0.
-if unit == "km/h":
-    display_stall = stall_speed * 3.6
-    display_max = max_groundspeed * 3.6
-    label = "km/h"
-else:
-    display_stall = stall_speed
-    display_max = max_groundspeed
-    label = "m/s"
-
-# ========================= GRAPHS =========================
-graph_result = create_flight_graphs(
-    unit,
-    relative_velocity,
-    lift,
-    drag,
-    thrust_curve,
-    max_airspeed * (3.6 if unit == "km/h" else 1.0),  # marker plotted on airspeed axis
-    stall_speed,
-    label,
-    time_data,
-    vel_time,
-    accel_time,
-    dist_time
-)
-
-lift_dragG = graph_result["lift_drag"]
-velocityG = graph_result["velocity"]
-ld_ratioG = graph_result["ld_ratio"]
-thrust_dragG = graph_result["thrust_drag"]
-accelerationG = graph_result["acceleration"]
-distanceG = graph_result["distance"]
-
-# ========================= TABS =========================
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🧩 Analysis", "🛫 Simulation", "📊 Graphs", "⚙️ Physics"
-])
-
-with tab1:
-    st.info(f"""
-    Aircraft Type: {plane_type}  |  Class: {aircraft_class}
-    Weight: {weight:.2f} kg  |  Wing Area: {wing_area:.2f} m²  |  Wing Loading: {wing_loading:.2f} kg/m²
-    """)
-
-    st.header("Aerodynamic Analysis")
-    st.plotly_chart(lift_dragG, use_container_width=True)
-
-    st.header("Key Metrics")
-    col1, col2, col3 = st.columns(3)
-    col4, col5, col6 = st.columns(3)
-
-    with col1:
-        st.metric(f"Stall Speed ({label})", f"{display_stall:.1f}")
-    with col2:
-        st.metric(f"Max Speed ({label})", f"{display_max:.1f}")
-    with col3:
-        st.metric("Takeoff Distance (m)", f"{takeoff_distance:.1f}" if takeoff_distance is not None else "N/A")
-    with col4:
-        if takeoff_speed is not None:
-            takeoff_display = takeoff_speed if unit == "km/h" else takeoff_speed / 3.6
-            st.metric(f"Takeoff Speed ({label})", f"{takeoff_display:.1f}")
+    # Each section is a collapsible expander so the sidebar can be folded
+    # down to just the controls you're actively tweaking. Widgets created
+    # inside a `with` block render inside that expander.
+    with st.sidebar.expander("Mass & Thrust", expanded=True):
+        if plane_type in PLANE_TYPE_RANGES:
+            ranges = PLANE_TYPE_RANGES[plane_type]
+            weight = st.slider("Weight (kg)", **ranges["weight"])
+            wing_area = st.slider("Wing Area (m²)", **ranges["wing_area"])
+            thrust = st.slider("Thrust (N)", **ranges["thrust"])
         else:
-            st.metric(f"Takeoff Speed ({label})", "N/A")
-    with col5:
-        st.metric("Takeoff Time (s)", f"{takeoff_time:.1f}" if takeoff_time is not None else "N/A")
-    with col6:
-        st.metric("Reynolds Number", f"{Re:,.0f}")
+            weight = st.number_input("Weight (kg)", min_value=0.01, value=1.5)
+            wing_area = st.number_input("Wing Area (m²)", min_value=0.01, value=0.2)
+            thrust = st.number_input("Thrust (N)", min_value=0.1, value=30.0)
 
-    if stall_speed > max_airspeed:
-        st.error("Aircraft cannot sustain stable flight.")
-    elif takeoff_distance is None:
-        st.warning("Aircraft failed to take off.")
-    else:
-        st.success("Aircraft configuration is flyable.")
+    with st.sidebar.expander("Wing Geometry", expanded=True):
+        cd_base = st.slider(
+            "Parasitic Drag Coefficient (Cd₀)", 0.02, 0.2, 0.05, 0.001,
+            help="Baseline drag from everything that ISN'T lift-induced (skin friction, fuselage, etc.)."
+        )
+        aoa = st.slider(
+            "Angle of Attack (°)", -5.0, 20.0, 5.0, 0.1,
+            help="The angle the wing meets the air at. More lift, up to a point — then it stalls."
+        )
+        stall_aoa = st.slider(
+            "Critical AoA (°)", 10.0, 20.0, 15.0,
+            help="The AoA at which the wing stalls (lift collapses)."
+        )
+        chord = st.slider(
+            "Mean Chord (m)", 0.05, 0.5, 0.15,
+            help="Wing depth, front to back. Drives Reynolds number and, with wing area, aspect ratio."
+        )
 
-with tab2:
-    st.header("Takeoff Simulation")
-    st.plotly_chart(velocityG, use_container_width=True)
+    with st.sidebar.expander("Flight Conditions", expanded=True):
+        wind_kmh = st.slider("Headwind (+) / Tailwind (-) (km/h)", -30, 30, 0)
+        wind = wind_kmh / MS_TO_KMH
+        pitch_speed = st.slider(
+            "Prop Pitch Speed (m/s)", 10.0, 80.0, 45.0,
+            help="Airspeed at which a fixed-pitch propeller's thrust theoretically reaches zero."
+        )
 
+    st.sidebar.markdown("#### Display")
+    unit = st.sidebar.radio("Speed Unit", ["km/h", "m/s"], horizontal=True)
+
+    return dict(
+        plane_type=plane_type, aircraft_class=aircraft_class,
+        weight=weight, wing_area=wing_area, thrust=thrust,
+        cd_base=cd_base, aoa=aoa, stall_aoa=stall_aoa, chord=chord,
+        wind=wind, pitch_speed=pitch_speed, unit=unit,
+    )
+
+
+# ============================================================
+# Tab 1 — Flight Performance
+# ============================================================
+def render_efficiency_badge(ld_ratio):
+    """A single-line qualitative read on the aircraft's L/D ratio."""
     if ld_ratio > 15:
-        st.success("Excellent Efficiency")
+        st.success("🟢 Excellent aerodynamic efficiency (L/D > 15)")
     elif ld_ratio > 10:
-        st.info("Good Flight Characteristics")
+        st.info("🔵 Good flight characteristics (L/D > 10)")
     elif ld_ratio > 6:
-        st.warning("Marginal Efficiency")
+        st.warning("🟡 Marginal efficiency (L/D > 6)")
     else:
-        st.error("Poor Aerodynamic Performance")
+        st.error("🔴 Poor aerodynamic performance (L/D ≤ 6)")
 
-with tab3:
-    colA, colB = st.columns(2)
-    colC, colD = st.columns(2)
-    with colA:
-        st.plotly_chart(ld_ratioG, use_container_width=True)
-    with colB:
-        st.plotly_chart(thrust_dragG, use_container_width=True)
-    with colC:
-        st.plotly_chart(accelerationG, use_container_width=True)
-    with colD:
-        st.plotly_chart(distanceG, use_container_width=True)
 
-with tab4:
-    st.header("Physics Breakdown")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Aircraft Config")
-        st.write(f"**Type:** {plane_type}  |  **Class:** {aircraft_class}")
-        st.write(f"**Weight:** {weight:.3f} kg  ({weight * 9.81:.2f} N)")
-        st.write(f"**Wing Area:** {wing_area:.3f} m²  |  **Chord:** {chord:.3f} m")
-        st.write(f"**Aspect Ratio:** {aspect_ratio:.2f}")
-        st.write(f"**Oswald Efficiency (e):** {oswald_efficiency:.2f}")
-        st.write(f"**Induced Drag Factor (k):** {induced_drag_factor:.4f}")
-        st.write(f"**Wing Loading:** {wing_loading:.2f} kg/m²")
-    with c2:
-        st.subheader("Computed Results")
-        st.write(f"**CLmax (at critical AoA):** {cl_max:.3f}")
-        st.write(f"**Stall Speed:** {display_stall:.2f} {label}")
-        st.write(f"**Max Speed (ground):** {display_max:.2f} {label}")
-        st.write(f"**L/D Ratio (max):** {ld_ratio:.2f}")
-        st.write(f"**Reynolds Number (max):** {Re:,.0f}")
+def render_performance_tab(aero, graphs, unit):
+    """Key aerodynamic metrics plus the speed-domain charts (lift/drag/
+    thrust and L/D ratio)."""
+    st.subheader("Key Metrics")
 
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Stall Speed", format_speed(aero["stall_speed"], unit),
+            help="Minimum airspeed the wing can generate enough lift at, at its critical AoA."
+        )
+    with col2:
+        margin = convert_speed(aero["max_airspeed"] - aero["stall_speed"], unit)
+        st.metric(
+            "Max Speed (ground)", format_speed(aero["max_groundspeed"], unit),
+            delta=f"{margin:+.1f} {unit} vs. stall",
+            help="Groundspeed where available thrust equals drag. Reported as groundspeed "
+                 "(what you'd see over the field), which differs from airspeed when wind != 0."
+        )
+    with col3:
+        st.metric("Wing Loading", f"{aero['wing_loading']:.2f} kg/m²")
+
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        st.metric("L/D Ratio (max)", f"{aero['ld_ratio']:.2f}")
+    with col5:
+        st.metric("Aspect Ratio", f"{aero['aspect_ratio']:.2f}")
+    with col6:
+        st.metric("CLmax", f"{aero['cl_max']:.3f}", help="Max lift coefficient, at the critical AoA.")
+
+    render_efficiency_badge(aero["ld_ratio"])
+
+    st.divider()
+    st.subheader("Aerodynamics vs Airspeed")
+    col_main, col_side = st.columns([3, 2])
+    with col_main:
+        st.plotly_chart(graphs["lift_drag_thrust"], use_container_width=True)
+    with col_side:
+        st.plotly_chart(graphs["ld_ratio"], use_container_width=True)
+
+
+# ============================================================
+# Tab 2 — Takeoff Roll
+# ============================================================
+def render_takeoff_status(sim, unit):
+    """The single authoritative takeoff status message, driven by
+    `takeoff_reason` so the explanation always matches what actually
+    happened in the simulation."""
+    reason = sim["takeoff_reason"]
+
+    if reason == "success":
+        st.success("✅ This configuration takes off successfully.")
+    elif reason == "insufficient_static_thrust":
+        st.error(
+            "❌ Thrust can't even overcome rolling friction — the aircraft will never start "
+            "moving. Increase thrust or reduce weight."
+        )
+    elif reason == "insufficient_top_speed":
+        req = format_speed(sim["required_liftoff_speed_ms"], unit, decimals=0)
+        mx = format_speed(sim["max_reachable_speed_ms"], unit, decimals=0)
+        st.warning(
+            f"⚠️ Needs roughly **{req}** to lift off, but this configuration tops out around "
+            f"**{mx}**. Increase thrust, reduce weight, or increase wing area."
+        )
+        required = sim["required_liftoff_speed_ms"]
+        reachable_ratio = min(1.0, sim["max_reachable_speed_ms"] / required) if required > 0 else 0.0
+        st.progress(reachable_ratio, text=f"Reaches {reachable_ratio * 100:.0f}% of the speed needed to lift off")
+    else:  # "timeout"
+        st.warning("⚠️ Didn't lift off within the simulated time window — check your configuration.")
+
+
+def render_takeoff_tab(sim, graphs, unit):
+    """Takeoff result status, headline numbers, and the three time-domain
+    charts (velocity / acceleration / distance vs. time)."""
+    st.subheader("Takeoff Result")
+    render_takeoff_status(sim, unit)
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        value = f"{sim['takeoff_distance']:.1f} m" if sim["takeoff_distance"] is not None else "—"
+        st.metric("Takeoff Distance", value)
+    with col2:
+        value = format_speed(sim["takeoff_speed_ms"], unit) if sim["takeoff_speed_ms"] is not None else "—"
+        st.metric("Takeoff Speed", value)
+    with col3:
+        value = f"{sim['takeoff_time']:.1f} s" if sim["takeoff_time"] is not None else "—"
+        st.metric("Takeoff Time", value)
+
+    st.divider()
+    st.subheader("Takeoff Roll Over Time")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.plotly_chart(graphs["velocity_time"], use_container_width=True)
+    with col2:
+        st.plotly_chart(graphs["acceleration_time"], use_container_width=True)
+    with col3:
+        st.plotly_chart(graphs["distance_time"], use_container_width=True)
+
+
+# ============================================================
+# Tab 3 — Physics Details
+# ============================================================
+def render_physics_tab(inputs, aero):
+    """Aircraft configuration, derived coefficients, and the governing
+    equations — the "show your work" tab."""
+    st.subheader("Aircraft Configuration")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write(f"**Type:** {inputs['plane_type']}  |  **Class:** {inputs['aircraft_class']}")
+        st.write(f"**Weight:** {inputs['weight']:.3f} kg  ({inputs['weight'] * G:.2f} N)")
+        st.write(f"**Wing Area:** {inputs['wing_area']:.3f} m²  |  **Chord:** {inputs['chord']:.3f} m")
+        st.write(f"**Aspect Ratio:** {aero['aspect_ratio']:.2f}")
+    with col2:
+        st.write(f"**Oswald Efficiency (e):** {aero['oswald_efficiency']:.2f}")
+        st.write(f"**Induced Drag Factor (k):** {aero['induced_drag_factor']:.4f}")
+        st.write(f"**Parasitic Drag Multiplier:** {aero['parasitic_multiplier']:.2f}")
+        st.write(f"**Reynolds Number (at max speed):** {np.max(aero['re_curve']):,.0f}")
+
+    st.divider()
     st.subheader("Equations Used")
-    st.latex(r"L = \frac{1}{2} \rho v^2 S C_L")
-    st.latex(r"D = \frac{1}{2} \rho v^2 S C_D")
-    st.latex(r"C_D = C_{D_0} + k C_L^2")
-    st.latex(r"Re = \frac{\rho v c}{\mu}")
-    st.latex(r"C_D = C_{D_0}\cdot\text{parasitic mult.} + \frac{C_L^2}{\pi \cdot AR \cdot e}")
-    st.latex(r"V_{stall} = \sqrt{\frac{2W}{\rho S C_{L_{max}}}} \quad \text{(evaluated at critical AoA)}")
+    st.latex(r"L = \tfrac{1}{2}\rho v^2 S C_L \qquad D = \tfrac{1}{2}\rho v^2 S C_D")
+    st.latex(r"C_D = C_{D_0}\cdot(\text{parasitic mult.}) + \dfrac{C_L^2}{\pi \cdot AR \cdot e}")
+    st.latex(r"V_{stall} = \sqrt{\dfrac{2W}{\rho\, S\, C_{L_{max}}}} \quad \text{(evaluated at the critical AoA)}")
+    st.latex(r"Re = \dfrac{\rho\, v\, c}{\mu}")
+
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    st.set_page_config(page_title="AetherFlight", layout="wide", page_icon="✈️")
+    inject_styles()
+
+    st.title("✈️ AetherFlight")
+    st.caption("Aerodynamic analysis & takeoff simulation for RC aircraft")
+    st.divider()
+
+    inputs = render_sidebar()
+
+    aero = calculate_aerodynamics(
+        inputs["weight"], inputs["wing_area"], inputs["thrust"], inputs["cd_base"],
+        inputs["aoa"], inputs["stall_aoa"], inputs["chord"], inputs["wind"],
+        inputs["pitch_speed"], inputs["aircraft_class"]
+    )
+    sim = simulate_takeoff(
+        inputs["weight"], inputs["wing_area"], inputs["thrust"], inputs["cd_base"],
+        inputs["aoa"], inputs["stall_aoa"], inputs["chord"], inputs["wind"],
+        inputs["pitch_speed"], inputs["aircraft_class"]
+    )
+
+    required_lift_n = LIFTOFF_LIFT_MARGIN * inputs["weight"] * G
+
+    graphs = create_flight_graphs(
+        inputs["unit"], aero["airspeed"], aero["lift"], aero["drag"], aero["thrust_curve"],
+        aero["stall_speed"], aero["max_airspeed"], required_lift_n,
+        sim["time_data"], sim["vel_time"], sim["accel_time"], sim["dist_time"],
+        takeoff_time=sim["takeoff_time"], takeoff_speed_ms=sim["takeoff_speed_ms"],
+    )
+
+    tab1, tab2, tab3 = st.tabs(["📊 Flight Performance", "🛫 Takeoff Roll", "⚙️ Physics Details"])
+    with tab1:
+        render_performance_tab(aero, graphs, inputs["unit"])
+    with tab2:
+        render_takeoff_tab(sim, graphs, inputs["unit"])
+    with tab3:
+        render_physics_tab(inputs, aero)
+
+    st.caption(f"AetherFlight v{APP_VERSION}")
+
+
+if __name__ == "__main__":
+    main()
